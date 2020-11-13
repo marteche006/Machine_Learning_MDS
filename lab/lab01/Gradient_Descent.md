@@ -1,0 +1,1 @@
+Calculo de la función de coste y vector del descenso del gradiente en python Jupyter.
