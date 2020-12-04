@@ -1,0 +1,1 @@
+In this paper, we will analyse the "Credit Default" database, for which we have developed a set of predictive model scripts to predict credit default.
