@@ -1,0 +1,2 @@
+Work done by Gonzalo Rodríguez and Mario Arteche.
+In this work we have carried out an EDA and cleaning of variables, to build a series of predictive models, in order to be able to predict the granting of credit.
