@@ -1,0 +1,631 @@
+---
+title: "Análisis municipal de la renta"
+author: "Mario Arteche Miranda y Gonzalo Rodríguez Cañada"
+date: "Sys.Date()"
+output:
+  prettydoc::html_pretty:
+    theme: tactile
+    highlight: github
+  pdf_document: default
+---
+
+```{r include=FALSE}
+knitr::opts_chunk$set(echo = F, warning = FALSE, message = FALSE)
+```
+
+# OBJETIVOS DEL TRABAJO
+
+Este grupo de trabajo se plantea la siguiente pregunta: ¿ A traves de ciertas variables, de rango municipal, es posible predecir si la renta de un determinado municipio estrá clasificada como renta baja (grupo 1), renta media (grupo 2) y renta alta (grupo 3)? Para ello se han recogido datos de la pagina web de la Comunidad de Madrid para el año 2014 y creado una variable dummy para determinar con un 1 municipios con renta baja(Municipios Deprimidos, MD), con un 2 municipios con renta media(Municpios Medios, MM) y con un 3 municipios con renta alta (Municipios Ricos, MR). Se utilizaran algoritmos de cross validation para la elección de las variables explicativas y se propondrán diferentes modelos de clasificación y predicción con el fin de encontar aquel con mayor porcentaje de acierto. 
+
+# INDICE
+
+1. Presentación y preparación de los datos.
+
+2. Eleccion de las variables explicativas y análisis exploratorio.
+
+3. Regresion logística multinomial.
+
+4. Quadratic Discriminant Analysis (QDA).
+
+5. Random Forest.
+
+6. XGBoost.
+
+7. Conclusiones.
+
+8. Representación gráfica: Leaflet.
+
+## 1. Presentación y limpieza de los datos.
+
+```{r, message=FALSE, warning=FALSE}
+library(readxl)
+library(tidyverse)
+library(janitor) 
+library(magrittr)
+library(skimr)
+library(ggplot2)
+library(caret)
+library(leaps)
+library(PerformanceAnalytics)
+library(pscl) 
+library(pROC)
+library(klaR)
+library(rpart)
+library(rpart.plot)
+library(raster)
+library(nnet)
+library(lme4)
+library(MASS)
+library(randomForest)
+library(ROCR)
+library(xgboost)
+library(rgdal)
+library(tidyverse)
+library(broom)
+library(remotes)
+library(lares)
+library(vip)
+library(caret)
+```
+
+Este dataset es una composición de todas las variables posibles encontradas en la pagina web de la Comunidad de Madrid y que en apartados proximos filtraremos para solo quedarnos con las mas explicativas. Antes de realizar la elección de los regresores se realiza el calculo de los principales estadísticos de las variables numéricas, asi como observar si existen valores NaN entre la muestra. 
+Previamente, para la lectura de los datos, nos saltamos las 2 primeras filas, y limpiamos loa nombres, para dejarlos en un formato "cómodo" para trabajar con ellos.
+
+```{r carga datos}
+DF <- read_xls('pib_mun.xls',skip = 2)
+
+DF %<>% clean_names() 
+names(DF)
+```
+
+Seguidamente, observamos como las columnas que aparecen a continuación han de ser eliminadas, ya que arrojan información a posteriori de nuestra predicción, en el caso de no eliminarlas nos estarían sesgando el resultado obtenido.
+* Renta del trabajo (%)
+* Base imponible total por declaración
+* Base imponible del ahorro por declaración
+* Resultado de la declaración por declaración
+
+```{r skim}
+eliminar <- !names(DF) %in% c("renta_del_trabajo_percent", "base_imponible_del_ahorro_por_declaracion", "base_imponible_total_por_declaracion", "resultado_de_la_declaracion_por_declaracion")
+DF <- DF[,eliminar]
+skim(DF[,-1])
+DF<-DF[-(1:10),]
+head(DF)
+```
+
+Posteriormente, eliminamos la variable municipio, ya que no nos aporta ningún valor. Los algorítmos clasificarán y predecirán en función de las características de cada uno de los municipios, no por el nombre.
+
+```{r eliminamos variable municpio}
+df <- DF %>% 
+  dplyr::select(!municipio)
+```
+
+Tras tener el dataset en la forma que queremos, creamos 3 variables categóricas en función de los tramos de renta que consideramos oportunos para hacer nuestra clasificación.
+
+```{r}
+df[,'renta_cat'] <- cut(df$producto_interior_bruto_municipal_per_capita_a_euros_1, breaks = c(0,20000, 35000, 100000),
+                         labels = c('1', '2', '3'))
+
+names(df)
+```
+
+Al realizar un pequeño análisis a la variable renta observamos que presenta una mayor concentración de sus datos en las franjas entre 25000 y 50000 euros.
+
+```{r exploracion renta}
+hist(df$producto_interior_bruto_municipal_per_capita_a_euros_1, freq = F, ylim = c(0,0.00009), col = 'orange', main = 'Histograma de la renta', xlab = '')
+lines(density(df$producto_interior_bruto_municipal_per_capita_a_euros_1))
+
+ggplot(df, aes(x=0, y=producto_interior_bruto_municipal_per_capita_a_euros_1)) +
+  geom_boxplot( col = 'orange') +
+  ylab('Renta Municipal') +
+  ggtitle('Boxplot de la renta por municpios') +
+  theme_classic()
+
+```
+
+## 2. Eleccion de las variables explicativas y análisis exploratorio.
+
+Para la elección de las variables de nuestros futuros modelos utilizaremos el algoritmo de Best Subset que consiste en estimar todas las regresiones posibles con las combinaciones de los p regresores.
+
+El algoritmo sería considerar el modelo nulo que no presenta ningún regresor y predice segun la media. Con posterioridad, se van añadiendo regresores al modelo y se elige uno en funcion de los criterios de informacion.
+
+Después de realizar los cálculos, y teniendo en cuenta el modelo con mejor R2 adj, las variables explicativas de nuestros futuros modelos serán las siguientes: 
+
+```{r best subset}
+selector <- regsubsets(renta_cat ~. , data =df, method = "seqrep", nvmax=24)
+selector_summary <- summary(selector)
+
+comparacion <- data.frame(
+  Adj.R2 = (selector_summary$adjr2))
+
+coeficientes <- coef(selector, which.max(selector_summary$adjr2))
+columnas <- c("Coeficientes")
+knitr::kable(coeficientes, col.names = columnas)
+```
+
+Construimos un dataset nuevo con las variables selccionadas para realizar un pequeño análisis exploratorio y ver como afectan a la variable renta. 
+
+```{r ds model}
+df_selc <- df %>% 
+  dplyr::select(estaciones_cercanias_de_tren, 
+          paradas_de_autobus, 
+          farmacias_por_10_000_hab_2, 
+          centros_de_salud_por_10_000_hab_2, 
+          consultorios_locales_por_10_000_hab_2, 
+          comercio_y_hosteleria, 
+          transportes_y_almacenamiento,
+          administracion_publica_educacion_y_sanidad)
+DF_selc <- DF %>%
+   dplyr::select(municipio,
+          estaciones_cercanias_de_tren, 
+          paradas_de_autobus, 
+          farmacias_por_10_000_hab_2, 
+          centros_de_salud_por_10_000_hab_2, 
+          consultorios_locales_por_10_000_hab_2, 
+          comercio_y_hosteleria, 
+          transportes_y_almacenamiento,
+          administracion_publica_educacion_y_sanidad)
+```
+
+Para ello tipificamos las variables numéricas, ya que al tratarse de variables en diferentes escalas métricas, podría resultar demasiado complicado extraer conclusiones a partir de ellas.
+
+```{r tipificacion}
+df_selc <- scale(df_selc)
+df_selc <- as.data.frame(df_selc)
+df_model <- cbind(df$renta_cat, df_selc)
+names(df_model) <- c('renta', 'esta_tren', 'esta_bus', 'farmacias', 'medicos', 'consultorios', 'comercios', 'transportes','ad_publ')
+```
+
+Dicho lo cual, ploteamos la distribución de la renta de los municipios. Vemos que la distribución en nuestro dataset de trabajo está relativamente desbalanceada, con mayor presencia de barrios "pobres".
+
+```{r distribucion}
+barplot(table(df_model$renta),
+        horiz = 'TRUE',
+        col = c('orange', 'black',"red"), 
+        xlim=c(0,100),
+        xlab='observaciones',
+        main='Número de observaciones por cada categoría de renta')
+```
+
+Posteriormente, realizamos una matriz de correlación para observar la relación entre nuestras variables.
+Representando la matriz de correlación a través de elipses, observamos que no hay gran relacion entre los regresores lo que nos evitará problamas de multicolinealidad.
+
+```{r correlacion}
+corrplot::corrplot(cor(df_model[,-1]), method = 'ellipse', tl.col = 'black', type = 'upper')
+```
+         
+Mostramos en este otro gráfico las distrubuciones de las variables seleccionadas, asi como sus graficos de dispersión, observando de nuevo la poca relación que hay entre dichas variables. Salvo en el caso de estaciones de bus y tren, como es totalmente lógico.
+         
+```{r disperion regresores}
+chart.Correlation(df_model[,-1], histogram = TRUE, pch = 19)
+```
+          
+Realizamos tres gráficos que analizan las actividades financieras y comerciales en función del rango de renta, observando que aunque no hay grandes diferencias entre los dos niveles, los municipios con mayor renta pueden presentar datos con mayor variannza, lo que se explica por la existencia de ciertos municipios con una renta muy por encima de la media.
+
+```{r disperison dependiente, en función de algunas variables dependientes}
+par(mfrow = c(2,2))
+ggplot(df_model, aes(x = renta, y = medicos)) + 
+  geom_point(col = "orange") + 
+  xlab('Renta') + ylab('Centros médicos') +
+  theme_classic()
+
+ggplot(df_model, aes(x = renta, y = comercios)) + 
+  geom_point(col = "orange") + 
+  xlab('Renta') + ylab('Comercios') +
+  theme_classic()
+
+ggplot(df_model, aes(x = renta, y = esta_bus)) + 
+  geom_point(col = "orange") + 
+  xlab('Renta') + ylab('Comercios') +
+  theme_classic()
+
+ggplot(df_model, aes(x = renta, y = esta_tren)) + 
+  geom_point(col = "orange") + 
+  xlab('Renta') + ylab('Comercios') +
+  theme_classic()
+
+par(mfrow = c(1,1))
+```
+        
+## 3. Regresion logística.
+
+Antes de la construcción de los diferentes modelos pasamos a dividir nuestra base de datos en dos grupos, train para validar nuestros modelos y test para comprobar como de bien predicen. 
+
+```{r train, test}
+set.seed(2020)
+
+DF_model <- cbind(df_model, DF$municipio)
+division <- df_model$renta %>% 
+  createDataPartition(p = 0.85, list = FALSE)
+
+df_train  <- df_model[division, ]
+df_test <- df_model[-division, ]
+
+df_train$renta <- as.factor(df_train$renta)
+df_test$renta <- as.factor(df_test$renta)
+
+```
+
+```{r}
+set.seed(2020)
+division <- DF_model$renta %>% 
+  createDataPartition(p = 0.85, list = FALSE)
+
+DF_train  <- DF_model[division, ]
+DF_test <- DF_model[-division, ]
+
+DF_train$renta <- as.factor(DF_train$renta)
+DF_test$renta <- as.factor(DF_test$renta)
+
+
+```
+
+
+El primer modelo que se construirá será la regresión logistica multinomial, un tipo de análisis de regresión utilizado para predecir el resultado de una variable categórica en función de las variables independientes o predictoras. Es útil para modelar la probabilidad de un evento ocurriendo como función de otros factores.
+En estadística, la regresión logística multinomial generaliza el método de regresión logística para problemas multiclase, es decir, con más de dos posibles resultados discretos. Es decir, se trata de un modelo que se utiliza para predecir las probabilidades de los diferentes resultados posibles de una distribución categórica como variable dependiente, dado un conjunto de variables independientes.
+
+# Regresión Logística Multinomial:
+
+```{r}
+levels(df_model$renta)
+require(nnet)
+# Training the multinomial model
+multinom_model <- multinom(renta ~ ., data = df_train)
+# Checking the model
+summary(multinom_model)
+```
+
+```{r}
+predicted_class <- predict (multinom_model, newdata = df_test, 'class')
+summary(predicted_class)
+confu <- table(predicted_class, df_test$renta)
+confu
+confu_norm <- round((confu/26)*100,1)
+confu_norm
+accuracy <- (confu[1,1]+confu[2,2]+confu[3,3])/sum(confu)  
+
+cat("El acuraccy de la regresión logística multinomial es de ",round(accuracy,3) * 100, "%" )
+
+```
+
+```{r, message=FALSE,warning=FALSE}
+y_predmulti <- as.ordered(predicted_class)
+auc <- multiclass.roc(df_test$renta,y_predmulti, levels = c(1, 2,3) )
+print(auc)
+```
+
+```{r}
+
+log_mult <- mutate(df_test,predicted_class)
+log_mult$predicted_class %<>%
+  as.numeric()
+multis2 <- subset(log_mult, select = -c(renta, predicted_class))
+lares::mplot_gain(log_mult$renta, log_mult$predicted_class, multis2)
+```
+
+```{r}
+imp_log <- varImp(multinom_model)
+imp_log <- as.matrix(imp_log)
+imp_log <- as.data.frame(t(imp_log))
+imp_log <- as.matrix(imp_log)
+col_log <- colnames(imp_log)
+```
+
+```{r}
+barplot(imp_log,main = "Importancia relativa de las variables en el modelo logístico multinomial",names.arg = col_log,col = c("orange"))
+knitr::kable(imp_log)
+```
+
+# Bondad de ajusto de Mcfadden
+
+Calculamos el R2 Mcfadden para comprobar la bondad de nuestra regresión obteniendo un valor de 0.4 por lo que podemos estar muy satisfecho con nuestro modelo, ya que segun la teoría valores superiores a 0.3 indican gran consistencia del mismo. 
+
+```{r Mcfadden}
+pR2(multinom_model)
+```
+
+## 5. Modelo discriminante cuadraticos.
+
+Nuestro siguiente modelo es el discriminante cuadrático que es una variante de LDA en la que se estima una matriz de covarianza individual para cada clase de observaciones. QDA es particularmente útil si se sabe previamente que las clases individuales muestran covarianzas distintas. Una desventaja de la QDA es que no puede utilizarse como técnica de reducción de la dimensionalidad.
+
+```{r}
+modeloqda <- qda(renta ~ esta_tren + esta_bus + farmacias + medicos + 
+    consultorios + comercios + transportes + ad_publ, data = df_train)
+summary(modeloqda)
+```
+
+Calculamos la matriz de confusión y la matriz de confusión para obtener el acuraccy del modelo.
+
+```{r qda train}
+fit_qda <- predict(modeloqda, newdata = df_test,type ="class")
+summary(fit_qda$class)
+tabla_qda <- table(fit_qda$class, df_test$renta,
+                          dnn = c("observaciones", "predicciones")) 
+tabla_qda
+confu_norm1 <- round((tabla_qda/26)*100,1)
+confu_norm1
+
+
+accuracy2 <- (tabla_qda[1,1] + tabla_qda[2,2] + tabla_qda[3,3])/sum(tabla_qda)
+
+cat("El accuracy de QDA es de ",round(accuracy2,3) * 100, "%" )
+```
+
+# Curva Ganancia Acumulada QDA:
+
+La curva de ganancias acumuladas es una curva de evaluación que evalúa el rendimiento del modelo y compara los resultados con la selección aleatoria. Muestra el porcentaje de objetivos alcanzados cuando se considera un determinado porcentaje de la población con mayor probabilidad de ser objetivo según el modelo.
+
+```{r message=FALSE,warning=FALSE}
+fit_qda<-unlist(fit_qda)
+fit_qda<-as.data.frame(fit_qda)
+fit_qda<-fit_qda[1:26,]
+qda_mult <- mutate(df_test,fit_qda)
+multis1 <- subset(qda_mult, select = -c(renta, fit_qda))
+mplot_gain(qda_mult$renta, qda_mult$fit_qda, multis1)
+```
+
+# Modelo Random Forest:
+
+Un Random Forest es un conjunto (ensemble) de árboles de decisión combinados con bagging. Al usar bagging, lo que en realidad está pasando, es que distintos árboles ven distintas porciones de los datos. Ningún árbol ve todos los datos de entrenamiento. Esto hace que cada árbol se entrene con distintas muestras de datos para un mismo problema. De esta forma, al combinar sus resultados, unos errores se compensan con otros y tenemos una predicción que generaliza mejor.
+
+```{r}
+modeloRF <- randomForest(renta~.,data = df_train, importance = TRUE)
+modeloRF
+fit_RF <- predict(modeloRF, newdata = df_test, type = 'class')
+tabla_RF <- table(fit_RF, df_test$renta,
+                          dnn = c("observaciones", "predicciones")) 
+tabla_RF
+
+confu_norm2 <- round((tabla_RF/26)*100,1)
+confu_norm2
+
+accuracy3 <- (tabla_RF[1,1] + tabla_RF[2,2] + tabla_RF[3,3])/sum(tabla_RF)
+
+cat("El accuracy de Random Forest es de ",round(accuracy3,3) * 100, "%" )
+
+
+```
+
+Obtenemos el valor de la área bajo la curva para el modelo Random Forest
+
+```{r, message=FALSE,include=FALSE}
+y_predrf <- as.ordered(fit_RF)
+auc <- multiclass.roc(df_test$renta,y_predrf, levels = c(1, 2,3) )
+print(auc)
+
+```
+
+Y hacemos la curva de ganancia acumulada
+
+```{r message=FALSE,warning=FALSE}
+fit_rf<-unlist(fit_RF)
+fit_rf<-as.data.frame(fit_rf)
+rf_mult <- mutate(df_test,fit_rf)
+multis2 <- subset(rf_mult, select = -c(renta, fit_rf))
+mplot_gain(rf_mult$renta, rf_mult$fit_rf, multis2)
+```
+
+Aquí observamos la importancia relativa de las variables por clase, que posteriormente graficaremos.
+
+```{r}
+imp_RF <- varImp(modeloRF)
+imp_RF
+```
+
+```{r}
+imp_RF <- as.matrix(imp_RF)
+imp_RF <- as.data.frame(t(imp_RF))
+imp_RF <- as.matrix(imp_RF)
+col_RF <- colnames(imp_RF)
+```
+
+Graficamos la importancia de las variables.
+
+```{r message=FALSE,warning=FALSE}
+barplot(imp_RF,main = "Importancia relativa de las variables en el modelo Ramdon Forest",names.arg = col_RF,col = c("orange","red","green"),legend.text = c("Renta Baja", "Renta Media", "Renta Alta"))
+knitr::kable(imp_RF)
+```
+Hacemos la separación del dataset en train y test.
+```{r Data Partition}
+X_train <- df_train %>%
+  dplyr::select(!renta)
+
+Y_train <- as.factor(df_train[,1])
+X_test <- df_test %>%
+  dplyr::select(!renta)
+
+Y_test <- as.factor(df_test[,1])
+
+```
+
+```{r Conversion a Matriz}
+X_train = xgb.DMatrix(as.matrix(X_train))
+X_test = xgb.DMatrix(as.matrix(X_test))
+
+
+```
+
+
+# XGBOOST:
+
+XGBoost o Extreme Gradient Boosting, es uno de los algoritmos de machine learning de tipo supervisado más usados en la actualidad.
+Este algoritmo se caracteriza por obtener buenos resultados de predicción con relativamente poco esfuerzo, en muchos casos equiparables o mejores que los devueltos por modelos más complejos computacionalmente, en particular para problemas con datos heterogéneos.
+XGBoost es una herramienta muy útil para un data scientist y cuenta con implementaciones para diferentes lenguajes y entornos de programación.
+
+```{r}
+library(dplyr)
+library(MASS)
+xgb_trcontrol = trainControl(method = "cv",number = 5, allowParallel = TRUE, verboseIter = F,returnData = F )
+```
+
+Buscamos los mejores hiperparámetros.
+
+```{r Búsqueda de los mejores hiperparámetros} 
+xgbGrid <- expand.grid(nrounds = c(100,200),  # this is n_estimators in the python code above
+                       max_depth = c(10, 15, 20, 25),
+                       colsample_bytree = seq(0.5, 0.9, length.out = 5),
+                       ## The values below are default values in the sklearn-api. 
+                       eta = 0.1,
+                       gamma = 0,
+                       min_child_weight = 1,
+                       subsample = 1
+                      )
+
+```
+
+Entrenamos el modelo y buscamos los mejores hiperparámetros.
+
+```{r ,message = FALSE, warning= FALSE,include=FALSE}
+set.seed(2020) 
+
+xgb_model = train(
+  X_train, Y_train,  
+  trControl = xgb_trcontrol,
+  tuneGrid = xgbGrid,
+  method = "xgbTree"
+)
+
+```
+
+Los mejores hiperparámetros son :
+
+```{r best values for hyperparameters}
+knitr::kable(xgb_model$bestTune)
+```
+
+Calculamos el error cuadrático medio
+
+```{r Model Evaluation}
+predicted = predict(xgb_model, X_test)
+residuals = as.numeric(Y_test) - as.numeric(predicted)
+RMSE = sqrt(mean(residuals^2))
+cat('The root mean square error of the test data is ', round(RMSE,3),'\n')
+
+```
+Y el R-cuadrado
+
+```{r}
+y_test_mean = mean(as.numeric(Y_test))
+# Calculate total sum of squares
+tss =  sum((as.numeric(Y_test) - y_test_mean)^2 )
+# Calculate residual sum of squares
+rss =  sum(residuals^2)
+# Calculate R-squared
+rsq  =  1 - (rss/tss)
+cat('The R-square of the test data is ', round(rsq,3), '\n')
+```
+Asimismo, hacemos la matriz de confusión y la normalizada del modelo 
+```{r}
+tabla_xgb <- table(predicted, df_test$renta,
+                          dnn = c("observaciones", "predicciones")) 
+tabla_xgb
+
+confu_norm3 <- round((tabla_xgb/26)*100,1)
+confu_norm3
+
+accuracy4 <- (tabla_xgb[1,1] + tabla_xgb[2,2] + tabla_xgb[3,3])/sum(tabla_xgb)
+
+
+cat("El accuracy de XGBoost es de ",round(accuracy4,3) * 100, "%" )
+
+```
+Y mostramos la importancia relativa de las variables.
+
+```{r}
+imp_xgb<-varImp(xgb_model)
+imp_xgb
+```
+
+Hacemos la curva de ganancia acumulada.
+
+```{r}
+xgb_mult <- mutate(df_test,predicted)
+multis3 <- subset(xgb_mult, select = -c(renta, predicted))
+mplot_gain(xgb_mult$renta,xgb_mult$predicted , multis3)
+
+
+```
+
+```{r}
+imp_xgb<-as.matrix(imp_xgb$importance)
+imp_xgb<-as.data.frame(t(imp_xgb))
+imp_xgb<-as.matrix(imp_xgb)
+col_xgb<-colnames(imp_xgb)
+
+``` 
+
+Y mostramos la importancia relativa de las variables en el modelo Xgboost.
+
+```{r}
+barplot(imp_xgb,main="Importancia relativa de las variables en el modelo Xgboost",names.arg = col_RF,col=c("orange"))
+knitr::kable(imp_xgb)
+```
+
+Y creamos un shapefile, con los municipios de la Comunidad de Madrid, donde plotearemos nuestros resultados.
+
+```{r}
+
+shapefile <- readOGR(dsn = "C:/Users/Gonzalo/Desktop/CUNEF/T.Clas/Trabajo/data",layer = "BARRIOS")
+datos <-tidy(shapefile)
+datos<-mutate(datos, )
+mapa_csv<-write.csv(datos,"C:/Users/Gonzalo/Desktop/CUNEF/T.Clas/Trabajo/datos.csv")
+ggplot(shapefile, aes(x = long, y = lat, group = group,color= df_test$renta)) +
+  geom_polygon(color = "black", size = 0.1, fill = "lightgrey") +
+  coord_equal() +
+  theme_minimal()
+
+mapas<-read.csv("datos.csv",sep = ",")
+```
+
+Tras haber evaluado, nuestro conjunto de modelos, el modelo, con mayor accuraccy es el XGBoost (por lo tanto, a partir del cual predecimos en que franja de renta se encuentran los municipios).
+
+Para lo cual, vamos a incorporar una columna en nuestro dataset, que contenga el resultado arrojado por dicho modelo. Seguidamente, plantearemos un mapa que contenga los muncipios de madrid, y de la misma manera, establezca colores asociados a la categoría de renta de cada uno de ellos. 
+
+Cabe recalcar, que como las dimensiones d eun dataset y otro no coinciden, el resultado no podrá ser visualizado. Pero el proceso sería el siguiente:
+
+
+```{r Creamos la columna a partir de xgboost,include =FALSE}
+library("xlsx")
+xgboost_pred <- as.data.frame(fit_RF)
+df_test <- mutate(df_test,xgboost_pred)
+df_test <- cbind(df_test,DF_test[,10])
+df_test
+latitud <- c(40.4378698,40.5304446,40.0294906,40.2085565,40.2632605,40.3767757,40.4248085,40.4229024,40.6341055,40.1188932,41.0179223,41.0775168,40.6218485,40.9555015,40.4639103,40.7275062,40.6773288,40.7264451,40.8192448,40.5110559,40.3615113,41.1072912,41.139863,40.2943098,40.0694258,40.5488928)
+latitud <-as.data.frame(latitud)
+
+longitud <- c(-3.8196207,-3.4921776,-3.6379744,-3.9239576,-4.4836036,-4.2207087,-3.2686615,-3.5635828,-3.5159004,-3.164424,-3.644327,-3.4573889,-3.9260852,-3.8036612,-3.8981943,-3.8660312,-3.9842768,-4.0306544,-3.7176338,-3.5639412,-4.3487407,-3.5952259,-3.6102229,-3.3109323,-3.2414465,-4.1894165)
+longitud <-as.data.frame(longitud)
+df_test <-cbind(df_test,(longitud))
+df_test <-cbind(df_test,(latitud))
+
+names(df_test)
+df_test <- mutate(df_test,  Municipio = DF_test[, 10])
+df_test <- mutate(df_test,  Prediccion = fit_RF)
+df_test <-df_test[,-11]
+df_test <-df_test[,-10]
+write.csv(df_test,file = "Resultados_Madrid1.csv")
+
+
+```
+
+## 7. Conclusiones.
+
+Seguidamente, elaboraremos una tabla que contenga los accuracies de los distintos modelos para seleccionar el modelo que mayor precisión tenga. Que será con el que posteriormente hagamos nuestro shiny leaflet. 
+
+
+```{r}
+precision<- as.data.frame(c(accuracy,accuracy2,accuracy3,accuracy4))
+
+knitr::kable(precision,col.names = "Precisión")
+```
+```{r}
+confu_norm1
+```
+
+Escogemos, el modelo porque tiende a clasificar mejor las rentas bajas, que el modelo qda, que es lo que predomina en nuestro dataset.
+
+```{r}
+confu_norm2
+```
+
+Por último, elaboramos una shiny app donde mostramos los municipios, en términos de renta real y predicción.
+
